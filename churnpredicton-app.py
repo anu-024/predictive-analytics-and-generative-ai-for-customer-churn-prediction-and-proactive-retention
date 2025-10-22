@@ -1,84 +1,70 @@
-from sklearn.preprocessing import MinMaxScaler
 import streamlit as st
-import pickle
 import pandas as pd
-import time
+import numpy as np
+import pickle
 import shap
+import time
+import xgboost as xgb
+from sklearn.preprocessing import MinMaxScaler
 import google.generativeai as genai
 
-# Set Streamlit layout to wide and style the UI
-st.set_page_config(layout="wide", page_title="Customer Churn Prediction")
+# ------------------ PAGE CONFIG ------------------
+st.set_page_config(page_title="Customer Churn Prediction", layout="wide")
 
 st.markdown(
     """
     <style>
-        body {
-            background: linear-gradient(to right, #6a11cb, #2575fc);
-            font-family: 'Arial', sans-serif;
-        }
+        body {background: linear-gradient(to right, #6a11cb, #2575fc);}
         .stButton>button {
             background: linear-gradient(90deg, #6a11cb, #2575fc);
-            color: white;
-            font-size: 18px;
-            padding: 12px 24px;
-            border-radius: 8px;
-            transition: all 0.3s ease-in-out;
-            cursor: pointer;
-            border: none;
+            color: white; font-size: 18px; padding: 12px 24px;
+            border-radius: 8px; border: none; cursor: pointer;
+            transition: 0.3s;
         }
-        .stButton>button:hover {
-            background: linear-gradient(90deg, #2575fc, #6a11cb);
-            transform: scale(1.05);
-        }
+        .stButton>button:hover {transform: scale(1.05);}
         .prediction-result {
-            font-size: 22px;
-            padding: 10px;
-            border-radius: 10px;
-            text-align: center;
-            font-weight: bold;
-            transition: all 0.3s ease-in-out;
+            font-size: 22px; padding: 10px; border-radius: 10px;
+            text-align: center; font-weight: bold;
         }
-        .churned {
-            background-color: #ff4b4b;
-            color: white;
-        }
-        .retained {
-            background-color: #4CAF50;
-            color: white;
-        }
+        .churned {background-color: #ff4b4b; color: white;}
+        .retained {background-color: #4CAF50; color: white;}
     </style>
     """,
     unsafe_allow_html=True
 )
 
-# Load the trained model
-with open('best_model.pkl', 'rb') as file:
-    model = pickle.load(file)
+# ------------------ LOAD MODEL & SCALER ------------------
+@st.cache_resource
+def load_model_and_scaler():
+    with open("best_model.pkl", "rb") as f:
+        model = pickle.load(f)
+    with open("scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+    return model, scaler
 
-# Load the MinMaxScaler
-with open('scaler.pkl', 'rb') as file:
-    scaler = pickle.load(file)
+model, scaler = load_model_and_scaler()
 
-# Set up Gemini API Key
-genai.configure(api_key="AIzaSyAUVZBtiki0-vs4sRdrdBYGoBqDb5LYr0Q")
+# ------------------ GEMINI API ------------------
+genai.configure(api_key=st.secrets.get("GOOGLE_API_KEY", "YOUR_FALLBACK_KEY"))
 
 def explain_churn(features, values):
+    """Generate an AI-based churn explanation using Gemini."""
     prompt = f"""Based on the following customer details:
     {features}
     With values:
     {values}
     Provide an explanation why the customer is likely to churn or stay."""
-    
-    model = genai.GenerativeModel("models/gemini-1.5-pro-latest")
-    response = model.generate_content(prompt)
-    return response.text
+    try:
+        gmodel = genai.GenerativeModel("gemini-1.5-pro-latest")
+        response = gmodel.generate_content(prompt)
+        return response.text if hasattr(response, "text") else "Explanation unavailable."
+    except Exception as e:
+        return f"AI explanation unavailable: {e}"
 
-# Sidebar Information
+# ------------------ SIDEBAR INPUTS ------------------
 st.sidebar.title("🌟 User Inputs")
-st.sidebar.markdown("### ℹ️ About This Tool")
-st.sidebar.info("This AI-powered tool predicts whether a customer will churn based on financial and demographic details. Adjust inputs and hit 'Predict'!")
+st.sidebar.info("Adjust the values to see how customer churn risk changes.")
 
-# User Inputs in Sidebar
 user_inputs = {
     "CreditScore": st.sidebar.number_input("Credit Score", value=600, step=1),
     "Age": st.sidebar.number_input("Age", value=30, step=1),
@@ -91,52 +77,80 @@ user_inputs = {
     "Geography_Spain": int(st.sidebar.checkbox("Geography - Spain")),
     "Gender_Female": int(st.sidebar.checkbox("Gender - Female")),
     "Gender_Male": int(st.sidebar.checkbox("Gender - Male")),
-"HasCrCard_0": int(not st.sidebar.checkbox("Does not have Credit Card", key="HasCrCard")),
-"HasCrCard_1": int(st.sidebar.checkbox(" Has Credit Card", key="HasCrCard_1")),
-"IsActiveMember_0": int(not st.sidebar.checkbox("Not a Active Member", key="IsActiveMember")),
-"IsActiveMember_1": int(st.sidebar.checkbox("Active Member", key="IsActiveMember_1"))
-
-
+    "HasCrCard_0": int(not st.sidebar.checkbox("Does not have Credit Card")),
+    "HasCrCard_1": int(st.sidebar.checkbox("Has Credit Card")),
+    "IsActiveMember_0": int(not st.sidebar.checkbox("Not Active Member")),
+    "IsActiveMember_1": int(st.sidebar.checkbox("Active Member")),
 }
 
-# Convert inputs to DataFrame
-input_data = pd.DataFrame([user_inputs])
-input_data_scaled = input_data.copy()
-scale_vars = ["CreditScore", "EstimatedSalary", "Tenure", "Balance", "Age", "NumOfProducts"]
-input_data_scaled[scale_vars] = scaler.transform(input_data[scale_vars])
+input_df = pd.DataFrame([user_inputs])
+scale_cols = ["CreditScore", "EstimatedSalary", "Tenure", "Balance", "Age", "NumOfProducts"]
+input_scaled = input_df.copy()
+input_scaled[scale_cols] = scaler.transform(input_df[scale_cols])
 
-# Main Container
-st.markdown("<div class='main-container'>", unsafe_allow_html=True)
+# ------------------ PREDICTION ------------------
 st.title("✨ Customer Churn Prediction ✨")
-st.subheader("Will the customer stay or leave? Let's find out!")
-
-# Prediction Section
+st.subheader("Will the customer stay or leave?")
 st.markdown("---")
-st.header("🔍 Prediction")
 
 if st.button("Predict 🚀"):
     with st.spinner("⏳ Analyzing data..."):
         time.sleep(2)
-    
-    probabilities = model.predict_proba(input_data_scaled)[0]
-    prediction = model.predict(input_data_scaled)[0]
-    prediction_label = "Churned" if prediction == 1 else "Retained"
-    
-    st.markdown(f"<div class='prediction-result {'churned' if prediction == 1 else 'retained'}'>"
-                f"{'⚠️' if prediction == 1 else '✅'} <b>Predicted Status:</b> {prediction_label}</div>", 
-                unsafe_allow_html=True)
-    st.write(f"**📌 Probability of Churn:** {probabilities[1]:.2%}")
-    st.write(f"**📌 Probability of Retention:** {probabilities[0]:.2%}")
-    
-    # SHAP Explanation
-    explainer = shap.Explainer(model)
-    shap_values = explainer(input_data_scaled)
-    important_features = sorted(zip(input_data.columns, shap_values.values[0]), key=lambda x: abs(x[1]), reverse=True)
-    top_features = {feature: value for feature, value in important_features[:5]}
-    
-    # AI-based Explanation
-    ai_explanation = explain_churn(list(top_features.keys()), list(top_features.values()))
-    st.markdown("### 🤖 AI Explanation")
-    st.write(ai_explanation)
 
-st.markdown("</div>", unsafe_allow_html=True)
+    # Detect model type
+    model_type = type(model).__name__
+    st.caption(f"Loaded model type: {model_type}")
+
+    try:
+        # --- Handle sklearn XGBClassifier ---
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(input_scaled)[0]
+            pred = int(model.predict(input_scaled)[0])
+
+        # --- Handle raw XGBoost Booster model ---
+        elif isinstance(model, xgb.Booster):
+            dinput = xgb.DMatrix(input_scaled)
+            probs = model.predict(dinput)
+            pred = int(probs[0] > 0.5)
+            probs = [1 - probs[0], probs[0]]
+
+        else:
+            raise TypeError("Unsupported model type for prediction.")
+
+        # --- Display prediction ---
+        label = "Churned" if pred == 1 else "Retained"
+        st.markdown(
+            f"<div class='prediction-result {'churned' if pred else 'retained'}'>"
+            f"{'⚠️' if pred else '✅'} <b>Predicted Status:</b> {label}</div>",
+            unsafe_allow_html=True
+        )
+        st.write(f"**📊 Probability of Churn:** {probs[1]:.2%}")
+        st.write(f"**📊 Probability of Retention:** {probs[0]:.2%}")
+
+        # ---------------- SHAP EXPLANATION ----------------
+        try:
+            # Use TreeExplainer directly (avoid shap.Explainer recursion bug)
+            if isinstance(model, xgb.Booster):
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(xgb.DMatrix(input_scaled))
+            else:
+                explainer = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(input_scaled)
+
+            shap_array = shap_values[0] if isinstance(shap_values, list) else shap_values
+            important = sorted(
+                zip(input_df.columns, shap_array),
+                key=lambda x: abs(x[1]),
+                reverse=True
+            )
+            top_features = {k: float(v) for k, v in important[:5]}
+
+            ai_explanation = explain_churn(list(top_features.keys()), list(top_features.values()))
+            st.markdown("### 🤖 AI Explanation")
+            st.write(ai_explanation)
+
+        except Exception as e:
+            st.warning(f"SHAP explanation unavailable: {e}")
+
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
